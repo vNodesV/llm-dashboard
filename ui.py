@@ -273,6 +273,12 @@ class Dashboard:
         avg_long  = snap.avg_long
         peak      = snap.peak_tps
 
+        if snap.server_tg3s is not None:
+            self._addstr(row, 2, "3s Live ", curses.color_pair(CP_DIM))
+            self._addstr(row, 10, _fmt_tps(snap.server_tg3s), self._tps_color(snap.server_tg3s))
+            self._addstr(row, 22, "srv", curses.color_pair(CP_DIM) | curses.A_DIM)
+            row += 1
+
         self._addstr(row, 2, "3s Avg  ", curses.color_pair(CP_DIM))
         self._addstr(row, 10, _fmt_tps(avg_short), self._tps_color(avg_short))
         row += 1

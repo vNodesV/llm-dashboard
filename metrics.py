@@ -49,6 +49,7 @@ class MetricsSnapshot:
     # current decode
     decode_tps: Optional[float] = None
     prefill_tps: Optional[float] = None
+    server_tg3s: Optional[float] = None   # tg_3s from slot print_timing (server-computed)
 
     # rolling averages
     avg_short: Optional[float] = None
@@ -718,6 +719,7 @@ class Collector:
         # waiting for end-of-request.
         if self._log_parser.live_tps is not None and self._log_parser.is_generating:
             snap.decode_tps  = self._log_parser.live_tps
+            snap.server_tg3s = self._log_parser.live_tg3s
             snap.prefill_tps = self._log_parser.live_prefill_tps
             snap.n_output    = self._log_parser.live_n_decoded
             # Push live sample into rolling history (dedupe: only if changed)
