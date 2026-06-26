@@ -153,7 +153,9 @@ class Dashboard:
         if row < 0 or row >= h:
             return
         try:
-            self._stdscr.hline(row, 0, ch, w)
+            # hline() uses C chtype — can't hold multibyte Unicode (e.g. ─ = U+2500)
+            # addstr with a repeated string works correctly across all ncurses builds
+            self._stdscr.addstr(row, 0, (ch * w)[:w - 1])
         except curses.error:
             pass
 
