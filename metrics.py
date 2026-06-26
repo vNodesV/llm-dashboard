@@ -371,6 +371,13 @@ class Collector:
         self._csv_file = None
         self._request_counter = 0
 
+        # Counter state for Prometheus rate computation (Δtokens / Δtime)
+        self._prev_prom_ts: float = 0.0
+        self._prev_tokens_predicted: float = 0.0
+        self._prev_prompt_tokens: float = 0.0
+        self._prev_prompt_seconds: float = 0.0
+        self._prev_tokens_predicted_seconds: float = 0.0
+
         if cfg.csv_out:
             self._csv_file = open(cfg.csv_out, "w", newline="")
             self._csv_writer = csv.writer(self._csv_file)
@@ -460,6 +467,16 @@ class Collector:
             return False
 
     # ── Prometheus mode ───────────────────────────────────────────────────────
+    #
+    # Actual metric names (from /metrics HELP lines):
+    #   llamacpp:tokens_predicted_total          counter — cumulative generation tokens
+    #   llamacpp:tokens_predicted_seconds_total  counter — cumulative generation time
+    #   llamacpp:prompt_tokens_total             counter — cumulative prompt tokens
+    #   llamacpp:prompt_seconds_total            counter — cumulative prompt time
+    #   llamacpp:predicted_tokens_seconds        gauge   — all-time avg generation tok/s
+    #   llamacpp:prompt_tokens_seconds           gauge   — all-time avg prompt tok/s
+    #   llamacpp:requests_processing             gauge   — slots active now
+    #   llamacpp:n_decode_total                  counter — total llama_decode() calls
 
     def _poll_prometheus(self, sys_data: dict) -> Optional[MetricsSnapshot]:
         try:
@@ -469,26 +486,65 @@ class Collector:
 
         snap = MetricsSnapshot()
         snap.connected = True
+        now = time.monotonic()
 
-        tps = data.get("llamacpp:tokens_per_second")
-        if tps is not None and tps > 0:
-            snap.decode_tps = tps
-            self._decode_hist.push(tps)
-            if self._csv_writer:
-                self._csv_writer.writerow([time.time(), tps, None, None, None])
+        # ── Live decode tok/s — Δtokens_predicted / Δtime ────────────────────
+        curr_predicted = data.get("llamacpp:tokens_predicted_total", 0.0)
+        curr_pred_secs = data.get("llamacpp:tokens_predicted_seconds_total", 0.0)
+        dt = now - self._prev_prom_ts if self._prev_prom_ts else 0.0
+
+        live_tps: Optional[float] = None
+        if dt > 0 and curr_predicted > self._prev_tokens_predicted:
+            delta_tok = curr_predicted - self._prev_tokens_predicted
+            live_tps = delta_tok / dt
+        elif dt > 0 and curr_pred_secs > self._prev_tokens_predicted_seconds:
+            # Alternative: Δtokens / Δtime-in-seconds (more accurate when available)
+            delta_tok = curr_predicted - self._prev_tokens_predicted
+            delta_secs = curr_pred_secs - self._prev_tokens_predicted_seconds
+            if delta_secs > 0:
+                live_tps = delta_tok / delta_secs
+
+        # ── All-time average throughput (gauges updated at request completion) ─
+        avg_decode_tps  = data.get("llamacpp:predicted_tokens_seconds") or None
+        avg_prefill_tps = data.get("llamacpp:prompt_tokens_seconds") or None
+
+        # Use live rate during generation; fall back to all-time avg when idle
+        processing = data.get("llamacpp:requests_processing", 0)
+        snap.status = "GENERATING" if processing > 0 else "IDLE"
+
+        if live_tps and live_tps > 0:
+            snap.decode_tps = live_tps
+            self._decode_hist.push(live_tps)
+        elif avg_decode_tps and avg_decode_tps > 0 and snap.status == "IDLE":
+            snap.decode_tps = avg_decode_tps
+            # Only push to history once per completed request (detect via counter change)
+            if curr_predicted > self._prev_tokens_predicted:
+                self._decode_hist.push(avg_decode_tps)
+
+        # Prefill: all-time average gauge (only meaningful at request boundary)
+        snap.prefill_tps = avg_prefill_tps if avg_prefill_tps and avg_prefill_tps > 0 else None
 
         snap.avg_short = self._decode_hist.rolling_avg(self.cfg.avg_short_s)
         snap.avg_mid   = self._decode_hist.rolling_avg(self.cfg.avg_mid_s)
         snap.avg_long  = self._decode_hist.rolling_avg(self.cfg.avg_long_s)
         snap.peak_tps  = self._decode_hist.peak
 
-        snap.n_ctx_used = int(data.get("llamacpp:kv_cache_tokens", 0))
-        snap.n_ctx_total = 0  # not exposed by prometheus alone
-        snap.n_prompt = int(data.get("llamacpp:prompt_tokens_total", 0))
-        snap.n_output = int(data.get("llamacpp:generation_tokens_total", 0))
+        # Cumulative token counts (useful for session totals)
+        snap.n_prompt = int(curr_predicted)   # reuse field for total predicted
+        snap.n_output = int(data.get("llamacpp:prompt_tokens_total", 0))
 
-        processing = data.get("llamacpp:requests_processing", 0)
-        snap.status = "GENERATING" if processing > 0 else "IDLE"
+        # CSV
+        if self._csv_writer and snap.decode_tps:
+            self._csv_writer.writerow([time.time(), snap.decode_tps, snap.prefill_tps, None, None])
+
+        # Save counter state for next poll
+        self._prev_prom_ts = now
+        self._prev_tokens_predicted = curr_predicted
+        self._prev_tokens_predicted_seconds = curr_pred_secs
+        curr_prompt = data.get("llamacpp:prompt_tokens_total", 0.0)
+        curr_prompt_secs = data.get("llamacpp:prompt_seconds_total", 0.0)
+        self._prev_prompt_tokens = curr_prompt
+        self._prev_prompt_seconds = curr_prompt_secs
 
         self._apply_sys(snap, sys_data)
         return snap
