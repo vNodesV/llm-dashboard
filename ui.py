@@ -315,6 +315,10 @@ class Dashboard:
             ctx_attr = (curses.color_pair(CP_BAD) if ctx_frac > 0.9
                         else curses.color_pair(CP_WARN) if ctx_frac > 0.75
                         else curses.color_pair(CP_DIM))
+            # Show % of training context too if available
+            if snap.n_ctx_train:
+                train_pct = int(ctx_total / snap.n_ctx_train * 100)
+                ctx_str += f"  ({train_pct}% of {snap.n_ctx_train:,} train ctx)"
         else:
             ctx_str = "—"
             ctx_attr = curses.color_pair(CP_DIM)
@@ -336,6 +340,14 @@ class Dashboard:
         self._addstr(row, 2, "Load   ", curses.color_pair(CP_DIM))
         self._addstr(row, 9, f"{snap.load_avg:.1f}", curses.color_pair(CP_DIM))
         row += 1
+
+        if snap.model_params_b:
+            self._addstr(row, 2, "Params ", curses.color_pair(CP_DIM))
+            self._addstr(row, 9, f"{snap.model_params_b:.1f}B", curses.color_pair(CP_DIM))
+            if snap.model_size_gb:
+                self._addstr(row, 18, f"({snap.model_size_gb:.1f} GB on disk)",
+                             curses.color_pair(CP_DIM))
+            row += 1
 
         self._addstr(row, 2, "RAM    ", curses.color_pair(CP_DIM))
         ram_str = f"{_fmt_gb(snap.ram_used_gb)} / {_fmt_gb(snap.ram_total_gb)} GB"

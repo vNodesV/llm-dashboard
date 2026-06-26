@@ -34,8 +34,11 @@ class MetricsSnapshot:
     source: str = "?"                # "prometheus" | "log" | "offline"
     connected: bool = False
 
-    # model
+    # model (populated from /models on startup)
     model_name: str = ""
+    model_size_gb: float = 0.0
+    model_params_b: float = 0.0
+    n_ctx_train: int = 0
     server_uptime_s: Optional[float] = None
 
     # generation state
@@ -308,6 +311,50 @@ class PrometheusPoller:
 
 # ── System metrics ────────────────────────────────────────────────────────────
 
+class ModelsPoller:
+    """
+    One-shot fetch of /models to get static model metadata:
+    name, n_ctx, n_ctx_train, size, n_params.
+    Called once on startup; retried until successful.
+    """
+
+    def __init__(self, base_url: str, timeout: float = 3.0):
+        self.url = base_url.rstrip("/") + "/models"
+        self.timeout = timeout
+
+    def fetch(self) -> dict:
+        """
+        Returns dict with keys:
+          model_name, n_ctx, n_ctx_train, size_gb, params_b
+        Raises on failure so caller can retry.
+        """
+        import json
+        with urlopen(self.url, timeout=self.timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+
+        # llama-server returns both OAI-compat "data" array and "models" array
+        # "data" has the richer "meta" sub-object
+        result = {}
+        entries = body.get("data") or body.get("models") or []
+        if not entries:
+            return result
+
+        entry = entries[0]
+        raw_id = entry.get("id") or entry.get("name") or ""
+        # Strip path and .gguf suffix for display
+        name = raw_id.split("/")[-1]
+        if name.lower().endswith(".gguf"):
+            name = name[:-5]
+        result["model_name"] = name
+
+        meta = entry.get("meta") or {}
+        result["n_ctx"]       = int(meta.get("n_ctx", 0))
+        result["n_ctx_train"] = int(meta.get("n_ctx_train", 0))
+        result["size_gb"]     = meta.get("size", 0) / 1e9 if meta.get("size") else 0.0
+        result["params_b"]    = meta.get("n_params", 0) / 1e9 if meta.get("n_params") else 0.0
+        return result
+
+
 class SystemPoller:
     """Thin wrapper around psutil for system metrics."""
 
@@ -366,6 +413,10 @@ class Collector:
         self._sys_poller = SystemPoller()
         self._log_parser: Optional[LogParser] = None
         self._prom_poller: Optional[PrometheusPoller] = None
+        self._models_poller = ModelsPoller(
+            f"http://{cfg.host}:{cfg.port}"
+        )
+        self._model_meta: dict = {}   # populated on first successful /models fetch
         self._log_tail: List[str] = []
         self._csv_writer = None
         self._csv_file = None
@@ -413,6 +464,9 @@ class Collector:
                 self._log_parser = LogParser(log_path)
                 source = "log"
 
+        # Fetch static model metadata from /models (retry until success)
+        self._fetch_model_meta()
+
         interval = self.cfg.metrics_interval
 
         while not self._stop.is_set():
@@ -438,6 +492,18 @@ class Collector:
                         if log_path:
                             self._log_parser = LogParser(log_path)
                             source = "log"
+
+            # Retry /models if not yet fetched (server may have been slow to start)
+            if not self._model_meta:
+                self._fetch_model_meta()
+
+            # Stamp static model metadata onto every snapshot
+            if self._model_meta:
+                snap.model_name    = snap.model_name or self._model_meta.get("model_name", "")
+                snap.n_ctx_total   = snap.n_ctx_total or self._model_meta.get("n_ctx", 0)
+                snap.n_ctx_train   = self._model_meta.get("n_ctx_train", 0)
+                snap.model_size_gb = self._model_meta.get("size_gb", 0.0)
+                snap.model_params_b = self._model_meta.get("params_b", 0.0)
 
             snap.source = source
             snap.ts = time.time()
@@ -465,6 +531,13 @@ class Collector:
         except Exception:
             self._prom_poller = None
             return False
+
+    def _fetch_model_meta(self) -> None:
+        """Non-blocking best-effort fetch of /models metadata."""
+        try:
+            self._model_meta = self._models_poller.fetch()
+        except Exception:
+            pass  # server not ready yet; retried next tick
 
     # ── Prometheus mode ───────────────────────────────────────────────────────
     #
