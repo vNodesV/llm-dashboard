@@ -557,8 +557,9 @@ class Collector:
                             self._log_parser = LogParser(log_path)
                             source = "log"
 
-            # Retry /models if not yet fetched (server may have been slow to start)
-            if not self._model_meta:
+            # Re-fetch /models if not yet populated, or every 60s (catches model swaps)
+            elapsed = time.monotonic() - self._started_at
+            if not self._model_meta or (elapsed % 60) < interval:
                 self._fetch_model_meta()
 
             # Stamp static model metadata onto every snapshot
