@@ -115,14 +115,31 @@ class LogParser:
     )
 
     # Server slot/status patterns
-    RE_SLOT_START = re.compile(r"slot\s+launch.*task[_\s]id\s*[=:]\s*(\d+)", re.I)
-    RE_SLOT_DONE  = re.compile(r"slot\s+release.*task[_\s]id\s*[=:]\s*(\d+)", re.I)
-    RE_MODEL      = re.compile(r"model\s*=\s*(.+?)(?:\s*$|\s+\|)", re.I)
-    RE_MODEL_PATH = re.compile(r"llm_load_tensors|load_model.*?([^\s/]+\.gguf)", re.I)
+    # New format: "slot release: id  2 | task 92 | ..."
+    # Old format: "slot release ... task_id = 92 ..."
+    RE_SLOT_START = re.compile(
+        r"slot\s+launch.*?(?:task[_\s]id\s*[=:]\s*|task\s+)(\d+)", re.I
+    )
+    RE_SLOT_DONE  = re.compile(
+        r"slot\s+release.*?(?:task[_\s]id\s*[=:]\s*|task\s+)(\d+)", re.I
+    )
+    RE_MODEL_PATH = re.compile(r"([^\s/]+\.gguf)", re.I)
     RE_CTX        = re.compile(r"n_ctx\s*=\s*(\d+)", re.I)
-    RE_GENERATING = re.compile(r"slot\s+(?:process|generate|decode|eval)", re.I)
 
-    # Newer server format (b3xxx+)
+    # ── NEW: live timing lines emitted every ~3s during generation ────────────
+    # Format: "slot print_timing: id  2 | task 92 | n_decoded =  188, tg =  10.18 t/s, tg_3s =   8.18 t/s"
+    RE_SLOT_TIMING = re.compile(
+        r"slot\s+print_timing:.*?task\s+(\d+).*?n_decoded\s*=\s*(\d+)"
+        r".*?\btg\s*=\s*([\d.]+)\s*t/s(?:.*?\btg_3s\s*=\s*([\d.]+)\s*t/s)?",
+        re.I,
+    )
+    # Prefill line (if present): "slot eval: id X | task Y | ... prompt_tg = N t/s"
+    RE_SLOT_EVAL = re.compile(
+        r"slot\s+(?:eval|prompt).*?task\s+(\d+).*?(?:prompt_tg|pp)\s*=\s*([\d.]+)\s*t/s",
+        re.I,
+    )
+
+    # Older server format (b3xxx+) JSON timings in log
     RE_NEW_DECODE = re.compile(
         r'"timings".*?"predicted_per_second":\s*([\d.]+)', re.I
     )
@@ -134,13 +151,21 @@ class LogParser:
         self.path = path
         self._fh = None
         self._pos = 0
-        self._pending_prompt: Optional[float] = None
-        self._pending_total: Optional[int] = None
-        self._pending_eval_tokens: Optional[int] = None
-        self._pending_decode: Optional[float] = None
         self._ctx_total: int = 0
         self.model_name: str = ""
-        # completed request data (set on llama_print_timings block finish)
+
+        # Live state — updated on every slot print_timing line
+        self.live_tps: Optional[float] = None    # tg = X t/s (current overall)
+        self.live_tg3s: Optional[float] = None   # tg_3s = X t/s (3s rolling avg)
+        self.live_n_decoded: int = 0             # n_decoded so far this request
+        self.live_prefill_tps: Optional[float] = None
+
+        # Per-request accumulator (for legacy llama_print_timings format)
+        self._pending_prompt: Optional[float] = None
+        self._pending_eval_tokens: Optional[int] = None
+        self._pending_decode: Optional[float] = None
+
+        # completed request data
         self.last_record: Optional[RequestRecord] = None
         self.current_task: Optional[int] = None
         self.is_generating: bool = False
@@ -189,35 +214,71 @@ class LogParser:
         return new_lines
 
     def _parse_line(self, line: str) -> None:
-        # Model name
+        # ── Model name (one-time, from any .gguf reference in log) ───────────
         if not self.model_name:
             m = self.RE_MODEL_PATH.search(line)
-            if m and ".gguf" in m.group(0).lower():
-                raw = m.group(0)
-                gguf_m = re.search(r"([^\s/]+\.gguf)", raw, re.I)
-                if gguf_m:
-                    self.model_name = gguf_m.group(1).removesuffix(".gguf")
+            if m:
+                self.model_name = m.group(1).removesuffix(".gguf")
 
-        # Context size
+        # ── Context size (one-time) ───────────────────────────────────────────
         if not self._ctx_total:
             m = self.RE_CTX.search(line)
             if m:
-                self._ctx_total = int(m.group(1))
+                n = int(m.group(1))
+                # sanity: ignore tiny values (e.g. n_ctx_per_seq = 512)
+                if n >= 512:
+                    self._ctx_total = n
 
-        # Generation status
-        if self.RE_SLOT_START.search(line):
-            m = self.RE_SLOT_START.search(line)
-            if m:
-                self.current_task = int(m.group(1))
+        # ── NEW FORMAT: slot print_timing — live tok/s every ~3s ─────────────
+        # "slot print_timing: id  2 | task 92 | n_decoded = 188, tg = 10.18 t/s, tg_3s = 8.18 t/s"
+        m = self.RE_SLOT_TIMING.search(line)
+        if m:
+            self.current_task   = int(m.group(1))
+            self.live_n_decoded = int(m.group(2))
+            self.live_tps       = float(m.group(3))
+            self.live_tg3s      = float(m.group(4)) if m.group(4) else None
+            self.is_generating  = True
+            return  # dominant signal — skip legacy checks
+
+        # ── NEW FORMAT: slot prefill timing ───────────────────────────────────
+        m = self.RE_SLOT_EVAL.search(line)
+        if m:
+            self.live_prefill_tps = float(m.group(2))
+            return
+
+        # ── Slot start / release ──────────────────────────────────────────────
+        m = self.RE_SLOT_START.search(line)
+        if m:
+            self.current_task  = int(m.group(1))
             self.is_generating = True
 
-        if self.RE_GENERATING.search(line):
-            self.is_generating = True
+        m = self.RE_SLOT_DONE.search(line)
+        if m:
+            task_id = int(m.group(1))
+            # Emit completed request record using last known live values
+            if self.live_tps is not None or self._pending_decode is not None:
+                decode_tps = self.live_tps or self._pending_decode
+                n_output   = self.live_n_decoded or (self._pending_eval_tokens or 0)
+                self.last_record = RequestRecord(
+                    task_id=task_id,
+                    prefill_tps=self.live_prefill_tps or self._pending_prompt,
+                    decode_tps=decode_tps,
+                    n_prompt=0,   # not available in new format without separate eval line
+                    n_output=n_output,
+                    n_ctx=self._ctx_total,
+                    duration_s=(n_output / decode_tps) if decode_tps and n_output else None,
+                )
+            # Reset live state for next request
+            self.live_tps       = None
+            self.live_tg3s      = None
+            self.live_n_decoded = 0
+            self.live_prefill_tps = None
+            self._pending_prompt = None
+            self._pending_eval_tokens = None
+            self._pending_decode = None
+            self.is_generating  = False
 
-        if self.RE_SLOT_DONE.search(line):
-            self.is_generating = False
-
-        # llama_print_timings block
+        # ── LEGACY FORMAT: llama_print_timings block ──────────────────────────
         m = self.RE_PROMPT.search(line)
         if m:
             self._pending_prompt = float(m.group(2))
@@ -225,12 +286,11 @@ class LogParser:
         m = self.RE_EVAL.search(line)
         if m:
             self._pending_eval_tokens = int(m.group(1))
-            self._pending_decode = float(m.group(2))
+            self._pending_decode      = float(m.group(2))
 
         m = self.RE_TOTAL.search(line)
         if m:
             total_toks = int(m.group(1))
-            # timings block complete — emit record
             self.last_record = RequestRecord(
                 task_id=self.current_task,
                 prefill_tps=self._pending_prompt,
@@ -240,16 +300,15 @@ class LogParser:
                 n_ctx=self._ctx_total,
                 duration_s=(
                     (self._pending_eval_tokens / self._pending_decode)
-                    if self._pending_decode and self._pending_eval_tokens
-                    else None
+                    if self._pending_decode and self._pending_eval_tokens else None
                 ),
             )
-            self._pending_prompt = None
+            self._pending_prompt      = None
             self._pending_eval_tokens = None
-            self._pending_decode = None
-            self.is_generating = False
+            self._pending_decode      = None
+            self.is_generating        = False
 
-        # New-format JSON timings (llama-server b3xxx+)
+        # JSON timings (some b3xxx builds)
         m = self.RE_NEW_DECODE.search(line)
         if m:
             self._pending_decode = float(m.group(1))
@@ -634,9 +693,10 @@ class Collector:
             if len(self._log_tail) > self.cfg.log_lines_max:
                 self._log_tail = self._log_tail[-self.cfg.log_lines_max:]
 
-        # Absorb any completed request
+        # Absorb any completed request record
         rec = self._log_parser.last_record
-        if rec and (not self._req_hist.latest() or rec.ts > (self._req_hist.latest().ts if self._req_hist.latest() else 0)):
+        if rec and (not self._req_hist.latest() or
+                    rec.ts > (self._req_hist.latest().ts if self._req_hist.latest() else 0)):
             self._req_hist.push(rec)
             self._request_counter += 1
             self._log_parser.last_record = None
@@ -648,20 +708,34 @@ class Collector:
                     rec.n_output, rec.n_ctx,
                 ])
 
-        snap.model_name = self._log_parser.model_name
+        snap.model_name  = self._log_parser.model_name
         snap.n_ctx_total = self._log_parser._ctx_total
-        snap.status = "GENERATING" if self._log_parser.is_generating else "IDLE"
-        snap.task_id = self._log_parser.current_task
+        snap.status      = "GENERATING" if self._log_parser.is_generating else "IDLE"
+        snap.task_id     = self._log_parser.current_task
 
-        last = self._req_hist.latest()
-        if last:
-            snap.decode_tps  = last.decode_tps
-            snap.prefill_tps = last.prefill_tps
-            snap.n_prompt    = last.n_prompt
-            snap.n_output    = last.n_output
-            snap.n_ctx_used  = last.n_ctx
-        snap.last_request = last
+        # ── Live decode rate from slot print_timing (new format) ─────────────
+        # These lines fire every ~3s during generation — much better than
+        # waiting for end-of-request.
+        if self._log_parser.live_tps is not None and self._log_parser.is_generating:
+            snap.decode_tps  = self._log_parser.live_tps
+            snap.prefill_tps = self._log_parser.live_prefill_tps
+            snap.n_output    = self._log_parser.live_n_decoded
+            # Push live sample into rolling history (dedupe: only if changed)
+            last_hist = self._decode_hist.latest()
+            if last_hist is None or abs(snap.decode_tps - last_hist) > 0.01:
+                self._decode_hist.push(snap.decode_tps)
+        else:
+            # Fall back to last completed request values when idle
+            last = self._req_hist.latest()
+            if last:
+                snap.decode_tps  = last.decode_tps
+                snap.prefill_tps = last.prefill_tps
+                snap.n_prompt    = last.n_prompt
+                snap.n_output    = last.n_output
+                snap.n_ctx_used  = last.n_ctx
+            snap.last_request = last
 
+        snap.last_request = self._req_hist.latest()
         snap.avg_short = self._decode_hist.rolling_avg(self.cfg.avg_short_s)
         snap.avg_mid   = self._decode_hist.rolling_avg(self.cfg.avg_mid_s)
         snap.avg_long  = self._decode_hist.rolling_avg(self.cfg.avg_long_s)
