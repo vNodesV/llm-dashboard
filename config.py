@@ -25,7 +25,7 @@ class Config:
 
     # ── history ───────────────────────────────────────────────────────────────
     history_len: int = 120           # number of samples in sparkline history
-    avg_short_s: float = 3.0        # short rolling average window (seconds)
+    avg_short_s: float = 15.0       # short rolling average window (seconds) — wider than slot_print_timing interval (~3s)
     avg_mid_s: float = 60.0         # mid rolling average window (seconds)
     avg_long_s: float = 300.0       # long rolling average window (seconds)
 

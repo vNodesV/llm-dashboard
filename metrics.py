@@ -129,11 +129,13 @@ class LogParser:
 
     # ── NEW: live timing lines emitted every ~3s during generation ────────────
     # Format: "slot print_timing: id  2 | task 92 | n_decoded =  188, tg =  10.18 t/s, tg_3s =   8.18 t/s"
-    RE_SLOT_TIMING = re.compile(
-        r"slot\s+print_timing:.*?task\s+(\d+).*?n_decoded\s*=\s*(\d+)"
-        r".*?\btg\s*=\s*([\d.]+)\s*t/s(?:.*?\btg_3s\s*=\s*([\d.]+)\s*t/s)?",
+    # Extract task id and n_decoded first, then pull ALL key=value t/s pairs via findall.
+    RE_SLOT_TIMING_HDR = re.compile(
+        r"slot\s+print_timing:.*?task\s+(\d+).*?n_decoded\s*=\s*(\d+)",
         re.I,
     )
+    # Matches every "key = value t/s" pair on the line (tg, tg_3s, tg_10s, etc.)
+    RE_TG_PAIRS = re.compile(r"\b(tg(?:_\d+s)?)\s*=\s*([\d.]+)\s*t/s", re.I)
     # Prefill line (if present): "slot eval: id X | task Y | ... prompt_tg = N t/s"
     RE_SLOT_EVAL = re.compile(
         r"slot\s+(?:eval|prompt).*?task\s+(\d+).*?(?:prompt_tg|pp)\s*=\s*([\d.]+)\s*t/s",
@@ -232,13 +234,15 @@ class LogParser:
 
         # ── NEW FORMAT: slot print_timing — live tok/s every ~3s ─────────────
         # "slot print_timing: id  2 | task 92 | n_decoded = 188, tg = 10.18 t/s, tg_3s = 8.18 t/s"
-        m = self.RE_SLOT_TIMING.search(line)
+        # Two-step: header captures task+n_decoded; findall captures all tg_* pairs.
+        m = self.RE_SLOT_TIMING_HDR.search(line)
         if m:
             self.current_task   = int(m.group(1))
             self.live_n_decoded = int(m.group(2))
-            self.live_tps       = float(m.group(3))
-            self.live_tg3s      = float(m.group(4)) if m.group(4) else None
-            self.is_generating  = True
+            tg = dict(self.RE_TG_PAIRS.findall(line))
+            self.live_tps   = float(tg["tg"])       if "tg"    in tg else None
+            self.live_tg3s  = float(tg["tg_3s"])    if "tg_3s" in tg else None
+            self.is_generating = True
             return  # dominant signal — skip legacy checks
 
         # ── NEW FORMAT: slot prefill timing ───────────────────────────────────
@@ -722,6 +726,8 @@ class Collector:
             snap.server_tg3s = self._log_parser.live_tg3s
             snap.prefill_tps = self._log_parser.live_prefill_tps
             snap.n_output    = self._log_parser.live_n_decoded
+            # n_ctx_used = at least n_decoded; prompt tokens not in this log format
+            snap.n_ctx_used  = self._log_parser.live_n_decoded
             # Push live sample into rolling history (dedupe: only if changed)
             last_hist = self._decode_hist.latest()
             if last_hist is None or abs(snap.decode_tps - last_hist) > 0.01:
